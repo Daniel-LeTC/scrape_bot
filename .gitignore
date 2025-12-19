@@ -14,3 +14,5 @@ archived/
 .venv
 # Security
 .env
+check_organic_structure.py
+reverse_engineer.py
