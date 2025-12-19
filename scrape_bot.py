@@ -8,6 +8,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 
+import fastexcel  # Import trực tiếp
 import polars as pl
 import requests
 from dotenv import load_dotenv
@@ -37,6 +38,7 @@ class AutoLogin:
         print(f"Attempting login for user: {self.username}...")
         
         with sync_playwright() as p:
+            browser = None
             try:
                 # Launch browser in headless mode with stealth arguments
                 browser = p.chromium.launch(
@@ -50,42 +52,37 @@ class AutoLogin:
                 )
                 page = context.new_page()
 
-                # Navigate to login page
-                page.goto(self.login_url)
+                # Navigate to login page and wait for network to settle
+                page.goto(self.login_url, wait_until="networkidle")
                 
-                # Wait for input fields
-                page.wait_for_selector('input[name="username"], input[type="text"], input[type="email"]')
-                
-                # Identify username and password fields
-                username_field = page.query_selector('input[name="username"]') or \
-                                 page.query_selector('input[type="text"]') or \
-                                 page.query_selector('input[type="email"]')
-                
-                password_field = page.query_selector('input[name="password"]') or \
-                                 page.query_selector('input[type="password"]')
+                # Extra wait for JS/Hydration
+                page.wait_for_timeout(2000)
 
-                if not username_field or not password_field:
-                    print("Error: Could not locate login fields.")
+                # Wait for specific IDs provided by user
+                try:
+                    page.wait_for_selector('#username', timeout=15000)
+                except Exception:
+                    # Capture screenshot on failure for debugging
+                    debug_path = os.path.join(config.OUTPUT_DIR, "debug_login_error.png")
+                    page.screenshot(path=debug_path)
+                    print(f"Error: Timeout waiting for login fields. Screenshot saved to {debug_path}")
                     return None
-
-                # Input credentials
-                username_field.fill(self.username)
-                password_field.fill(self.password)
                 
-                # Submit form
-                login_btn = page.query_selector('button[type="submit"]') or \
-                            page.query_selector('button:has-text("Login")') or \
-                            page.query_selector('.login-button')
+                # Input credentials using exact IDs
+                page.fill('#username', self.username)
+                page.fill('#password', self.password)
                 
-                if login_btn:
-                    login_btn.click()
-                else:
-                    page.keyboard.press("Enter")
+                # Submit form using type="submit"
+                page.click('button[type="submit"]')
                 
-                # Wait for navigation to dashboard
-                print("Waiting for authentication...")
-                page.wait_for_url("**/dashboard**", timeout=30000)
-                print("Login successful.")
+                # Wait for navigation away from login page
+                print("Waiting for redirect...")
+                # Wait until URL does NOT contain 'signin' anymore
+                page.wait_for_function("!window.location.href.includes('signin')", timeout=30000)
+                
+                # Wait a bit for LocalStorage to be populated
+                page.wait_for_timeout(2000)
+                print("Login successful (Redirected).")
 
                 # Retrieve token from Local Storage
                 storage = page.evaluate("() => JSON.stringify(window.localStorage)")
@@ -103,11 +100,13 @@ class AutoLogin:
                             token = c['value']
                             break
                 
-                browser.close()
                 return token
             except Exception as e:
                 print(f"Login failed: {str(e)}")
                 return None
+            finally:
+                if browser:
+                    browser.close()
 
 
 class TokenStealer:
@@ -149,10 +148,15 @@ class PPCHarvester:
     def __init__(self, token):
         self.headers = config.get_headers(token)
 
-    def xlsx_to_parquet(self, xlsx_path, start_iso, end_iso):
-        """Converts Excel file to Parquet format using Calamine engine with range metadata."""
+    def xlsx_to_parquet(self, xlsx_path, start_iso, end_iso, suffix=""):
+        """Converts Excel file to Parquet format using fastexcel directly."""
         try:
-            df = pl.read_excel(xlsx_path, engine="calamine")
+            # Use fastexcel directly to read to Arrow, then to Polars
+            # This bypasses any engine string issues in pl.read_excel
+            excel_reader = fastexcel.read_excel(xlsx_path)
+            # Assuming data is in the first sheet
+            arrow_table = excel_reader.load_sheet(0).to_arrow()
+            df = pl.from_arrow(arrow_table)
             
             # Add range metadata columns
             df = df.with_columns([
@@ -162,9 +166,8 @@ class PPCHarvester:
                 pl.lit(end_iso).alias("Report_Date")
             ])
             
-            parquet_path = os.path.join(
-                config.SILVER_DATA_DIR, f"ppc_report_{start_iso}_{end_iso}.parquet"
-            )
+            filename = f"ppc_report_{start_iso}_{end_iso}{suffix}.parquet"
+            parquet_path = os.path.join(config.SILVER_DATA_DIR, filename)
             df.write_parquet(parquet_path, compression="zstd")
             return parquet_path
         except Exception as e:
@@ -192,14 +195,18 @@ class PPCHarvester:
             # Determine chunk end date based on step
             if step == "day":
                 chunk_end = current
+                suffix = "_daily"
             elif step == "month":
                 # Get last day of the current month
                 _, last_day = calendar.monthrange(current.year, current.month)
                 chunk_end = current.replace(day=last_day)
+                suffix = ""
             elif step == "year":
                 chunk_end = current.replace(month=12, day=31)
+                suffix = ""
             else: # total
                 chunk_end = end_date
+                suffix = ""
 
             # Clamp chunk_end to global end_date
             if chunk_end > end_date:
@@ -226,7 +233,7 @@ class PPCHarvester:
                 print(f"   [DEBUG] Params: {params}")
 
             if dry_run:
-                print(f"   [DRY-RUN] Would fetch and save to: ppc_report_{c_start_iso}_{c_end_iso}.xlsx")
+                print(f"   [DRY-RUN] Would fetch and save to: ppc_report_{c_start_iso}_{c_end_iso}{suffix}.parquet")
             else:
                 try:
                     response = requests.get(
@@ -234,14 +241,14 @@ class PPCHarvester:
                     )
 
                     if response.status_code == 200:
-                        # Save raw with range in filename
-                        xlsx_filename = f"ppc_report_{c_start_iso}_{c_end_iso}.xlsx"
+                        # Save raw with range in filename (Raw doesn't need suffix as much, but keep consistent)
+                        xlsx_filename = f"ppc_report_{c_start_iso}_{c_end_iso}{suffix}.xlsx"
                         xlsx_path = os.path.join(config.RAW_DATA_DIR, xlsx_filename)
                         
                         with open(xlsx_path, "wb") as f:
                             f.write(response.content)
                         
-                        self.xlsx_to_parquet(xlsx_path, c_start_iso, c_end_iso)
+                        self.xlsx_to_parquet(xlsx_path, c_start_iso, c_end_iso, suffix=suffix)
                         print(f"   Success: Saved {xlsx_filename}")
                     elif response.status_code == 401:
                         print("   Token expired during fetch!")
@@ -320,6 +327,95 @@ class DataProcessor:
         print(f"Master File generated: {output_path} ({master_df.height} rows)")
         return master_df
 
+    @staticmethod
+    def compact_daily_to_monthly(year, month):
+        """
+        Maintenance Task: Merges all daily files of a specific month into one monthly file.
+        Deletes daily files after successful merge to reduce clutter.
+        """
+        import glob
+        
+        # Pattern to match ONLY daily files for that month: ppc_report_2025-10-*_daily.parquet
+        pattern = os.path.join(config.SILVER_DATA_DIR, f"ppc_report_{year}-{month:02d}-*_daily.parquet")
+        daily_files = glob.glob(pattern)
+        
+        if not daily_files:
+            print(f"No daily files found for {year}-{month:02d} to compact.")
+            return
+
+        print(f"Compacting {len(daily_files)} daily files for {year}-{month:02d}...")
+        
+        try:
+            dfs = [pl.scan_parquet(f) for f in daily_files]
+            combined_df = pl.concat(dfs).collect()
+            
+            # Save as Monthly (No suffix to indicate it's an aggregate)
+            # Logic: Start of month to End of month
+            _, last_day = calendar.monthrange(year, month)
+            start_iso = f"{year}-{month:02d}-01"
+            end_iso = f"{year}-{month:02d}-{last_day}"
+            
+            monthly_filename = f"ppc_report_{start_iso}_{end_iso}.parquet"
+            monthly_path = os.path.join(config.SILVER_DATA_DIR, monthly_filename)
+            
+            combined_df.write_parquet(monthly_path, compression="zstd")
+            print(f"✅ Created monthly archive: {monthly_filename}")
+            
+            # Delete daily files
+            for f in daily_files:
+                if os.path.abspath(f) != os.path.abspath(monthly_path):
+                    os.remove(f)
+            
+            print(f"🗑️ Deleted {len(daily_files)} daily files.")
+            
+        except Exception as e:
+            print(f"❌ Compaction failed: {e}")
+
+    @staticmethod
+    def compact_monthly_to_yearly(year):
+        """
+        Maintenance Task: Merges all monthly files of a specific year into one yearly file.
+        Deletes monthly files after successful merge.
+        """
+        files_to_compact = []
+        
+        # Scan for expected monthly files (01 to 12)
+        for month in range(1, 13):
+            _, last_day = calendar.monthrange(year, month)
+            # Match standard monthly filename format
+            filename = f"ppc_report_{year}-{month:02d}-01_{year}-{month:02d}-{last_day}.parquet"
+            filepath = os.path.join(config.SILVER_DATA_DIR, filename)
+            
+            if os.path.exists(filepath):
+                files_to_compact.append(filepath)
+        
+        if not files_to_compact:
+            print(f"No monthly files found for year {year} to compact.")
+            return
+
+        print(f"Compacting {len(files_to_compact)} monthly files for year {year}...")
+        
+        try:
+            dfs = [pl.scan_parquet(f) for f in files_to_compact]
+            combined_df = pl.concat(dfs).collect()
+            
+            # Save as Yearly
+            yearly_filename = f"ppc_report_{year}-01-01_{year}-12-31.parquet"
+            yearly_path = os.path.join(config.SILVER_DATA_DIR, yearly_filename)
+            
+            combined_df.write_parquet(yearly_path, compression="zstd")
+            print(f"✅ Created yearly archive: {yearly_filename}")
+            
+            # Delete monthly files
+            for f in files_to_compact:
+                if os.path.abspath(f) != os.path.abspath(yearly_path):
+                    os.remove(f)
+            
+            print(f"🗑️ Deleted {len(files_to_compact)} monthly files.")
+            
+        except Exception as e:
+            print(f"❌ Yearly Compaction failed: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="PPC Scraper & Processor")
@@ -329,8 +425,33 @@ def main():
     parser.add_argument("--mode", choices=["full", "offline"], default="full", help="Operation Mode")
     parser.add_argument("--dry-run", action="store_true", help="Simulate run without making API requests")
     parser.add_argument("--debug", action="store_true", help="Enable verbose logging")
+    parser.add_argument("--compact", help="Run compaction. Format: 'YYYY-MM' (Daily->Month) or 'YYYY' (Month->Year)")
     
     args = parser.parse_args()
+
+    # Maintenance Mode
+    if args.compact:
+        parts = args.compact.split("-")
+        try:
+            if len(parts) == 2:
+                # Daily -> Monthly
+                y, m = map(int, parts)
+                DataProcessor.compact_daily_to_monthly(y, m)
+            elif len(parts) == 1:
+                # Monthly -> Yearly
+                y = int(parts[0])
+                DataProcessor.compact_monthly_to_yearly(y)
+            else:
+                print("Invalid format. Use YYYY-MM or YYYY.")
+                return
+            
+            # Re-generate master after compaction
+            DataProcessor.process_and_merge()
+            print("Compaction & Master Re-build Complete.")
+            return
+        except ValueError:
+            print("Invalid format for --compact.")
+            return
 
     user = os.getenv("PPC_USER")
     password = os.getenv("PPC_PASS")

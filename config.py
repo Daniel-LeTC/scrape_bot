@@ -3,8 +3,8 @@ import os
 
 # Cấu hình API
 API_BASE_URL = "https://ppc.api.app.tcsys.shop/api/dashboard/market/export"
-LOGIN_URL = "https://ppc.app.tcsys.shop/login"
-DASHBOARD_URL = "https://ppc.app.tcsys.shop/dashboard"
+LOGIN_URL = "https://ppc.app.tcsys.shop/auth/signin"
+DASHBOARD_URL = "https://ppc.app.tcsys.shop/?user-group=no"
 
 # Danh sách các fields cần lấy từ API
 DEFAULT_FIELDS = (
