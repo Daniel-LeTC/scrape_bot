@@ -11,3 +11,5 @@ exports/
 archived/
 # Virtual environments
 .venv
+# Security
+.env
